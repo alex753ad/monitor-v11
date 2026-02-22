@@ -565,6 +565,18 @@ def monitor_position(pos, exchange_name):
     if corr < 0.2:
         quality_warnings.append(f"⚠️ Корреляция ρ={corr:.2f} < 0.2 — хедж не работает!")
     
+    # v18: Direction sanity check — warn if direction contradicts entry Z
+    entry_z = pos.get('entry_z', 0)
+    direction = pos.get('direction', '')
+    if entry_z < -0.5 and direction == 'SHORT':
+        quality_warnings.append(
+            f"🚨 НАПРАВЛЕНИЕ ИНВЕРТИРОВАНО: Entry_Z={entry_z:+.2f} (отрицательный) "
+            f"но Dir=SHORT. Для Z<0 должен быть LONG! Проверьте ввод.")
+    elif entry_z > 0.5 and direction == 'LONG':
+        quality_warnings.append(
+            f"🚨 НАПРАВЛЕНИЕ ИНВЕРТИРОВАНО: Entry_Z={entry_z:+.2f} (положительный) "
+            f"но Dir=LONG. Для Z>0 должен быть SHORT! Проверьте ввод.")
+    
     return {
         'z_now': z_now,
         'z_entry': pos['entry_z'],
@@ -615,7 +627,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v12.0 | 22.02.2026 | GARCH Z + Halflife sync + False convergence enhanced")
+st.caption("v12.1 | 22.02.2026 | GARCH Z + Halflife sync + Direction sanity check")
 
 # Sidebar
 with st.sidebar:

@@ -30,8 +30,9 @@ try:
         calculate_hurst_exponent,
         calculate_hurst_ema,
         calculate_adaptive_robust_zscore,
-        assess_entry_readiness,
+        calculate_garch_zscore,
         calc_halflife_from_spread,
+        assess_entry_readiness,
         check_pnl_z_disagreement,
     )
     _USE_MRA = True
@@ -369,16 +370,29 @@ def monitor_position(pos, exchange_name):
     # v3.0: OU Half-life (dt-correct, как в сканере)
     dt_ou = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(tf, 1/6)
     hpb = {'1h': 1, '4h': 4, '1d': 24}.get(tf, 4)
-    hl_days = calc_halflife(spread, dt=dt_ou)
+    
+    # v18: Use SAME halflife function as scanner (critical for Z-window sync)
+    if _USE_MRA:
+        hl_days = calc_halflife_from_spread(spread, dt=dt_ou)
+    else:
+        hl_days = calc_halflife(spread, dt=dt_ou)
     hl_hours = hl_days * 24 if hl_days < 999 else 999
     hl_bars = (hl_hours / hpb) if hl_hours < 999 else None
     
     # v15: Use SAME Z-score function as scanner for consistency
     if _USE_MRA:
         z_now, zs, zw = calculate_adaptive_robust_zscore(spread, halflife_bars=hl_bars)
+        # v18: GARCH Z for false convergence detection
+        garch_info = calculate_garch_zscore(spread, halflife_bars=hl_bars)
+        z_garch = garch_info.get('z_garch', z_now)
+        garch_vol_ratio = garch_info.get('vol_ratio', 1.0)
+        garch_var_expanding = garch_info.get('variance_expanding', False)
     else:
         zs, zw = calc_zscore(spread, halflife_bars=hl_bars)
         z_now = float(zs[~np.isnan(zs)][-1]) if any(~np.isnan(zs)) else 0
+        z_garch = z_now
+        garch_vol_ratio = 1.0
+        garch_var_expanding = False
     
     # v3.0: Quality metrics (как в сканере)
     # v14: CRITICAL FIX — use SAME Hurst as scanner (DFA on increments)
@@ -482,12 +496,18 @@ def monitor_position(pos, exchange_name):
     if pos['direction'] == 'LONG':
         if z_now >= -ez and z_now <= ez:
             # v16: Check PnL before declaring convergence (рассуждение #1)
-            if pnl_pct > -0.3:  # Real convergence: Z→0 AND PnL not negative
+            # v18: Also check GARCH Z — if GARCH still far, it's variance collapse
+            garch_still_far = abs(z_garch) > 1.5
+            if pnl_pct > -0.3 and not garch_still_far:
                 exit_signal = '✅ MEAN REVERT — закрывать!'
                 exit_urgency = 2
+            elif garch_still_far:
+                exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z_std→0 но Z_GARCH={z_garch:+.1f}. '
+                               f'σ выросла в {garch_vol_ratio:.1f}x. Реального возврата нет.')
+                exit_urgency = 1
             else:
                 exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z→0 но P&L={pnl_pct:+.2f}%. '
-                               f'σ спреда выросла. Ждите реального возврата цен или таймаут.')
+                               f'σ спреда выросла. Ждите реального возврата цен.')
                 exit_urgency = 1
         elif z_now > 1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
@@ -497,13 +517,17 @@ def monitor_position(pos, exchange_name):
             exit_urgency = 2
     else:
         if z_now <= ez and z_now >= -ez:
-            # v16: Check PnL before declaring convergence
-            if pnl_pct > -0.3:
+            garch_still_far = abs(z_garch) > 1.5
+            if pnl_pct > -0.3 and not garch_still_far:
                 exit_signal = '✅ MEAN REVERT — закрывать!'
                 exit_urgency = 2
+            elif garch_still_far:
+                exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z_std→0 но Z_GARCH={z_garch:+.1f}. '
+                               f'σ выросла в {garch_vol_ratio:.1f}x. Реального возврата нет.')
+                exit_urgency = 1
             else:
                 exit_signal = (f'⚠️ ЛОЖНОЕ СХОЖДЕНИЕ: Z→0 но P&L={pnl_pct:+.2f}%. '
-                               f'σ спреда выросла. Ждите реального возврата цен или таймаут.')
+                               f'σ спреда выросла. Ждите реального возврата цен.')
                 exit_urgency = 1
         elif z_now < -1.0:
             exit_signal = '✅ OVERSHOOT — фиксировать прибыль!'
@@ -568,6 +592,10 @@ def monitor_position(pos, exchange_name):
         'pvalue': pvalue,
         'quality_data': quality_data,
         'quality_warnings': quality_warnings,
+        # v18: GARCH Z
+        'z_garch': z_garch,
+        'garch_vol_ratio': garch_vol_ratio,
+        'garch_var_expanding': garch_var_expanding,
     }
 
 
@@ -587,7 +615,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v11.0 | 21.02.2026 | False convergence fix + Hurst EMA + Z-sync")
+st.caption("v12.0 | 22.02.2026 | GARCH Z + Halflife sync + False convergence enhanced")
 
 # Sidebar
 with st.sidebar:
@@ -733,6 +761,17 @@ with tab1:
                 q3.metric("Корреляция ρ", f"{mon.get('correlation', 0):.3f}",
                          delta="🟢" if mon.get('correlation', 0) >= 0.5 else "⚠️")
                 q4.metric("Z-window", f"{mon.get('z_window', 30)} баров")
+                
+                # v18: GARCH Z row
+                if mon.get('z_garch') is not None:
+                    gq1, gq2, gq3, gq4 = st.columns(4)
+                    gq1.metric("Z GARCH", f"{mon.get('z_garch', 0):+.2f}",
+                               f"vs std={mon.get('z_now',0):+.2f}")
+                    vr = mon.get('garch_vol_ratio', 1.0)
+                    gq2.metric("σ ratio", f"{vr:.2f}x",
+                               "🔴 растёт" if mon.get('garch_var_expanding') else "✅ стабильна")
+                    gq3.metric("HL часов", f"{mon.get('halflife_hours', 0):.1f}")
+                    gq4.metric("Z-window", f"{mon.get('z_window', 30)} бар")
                 
                 # v3.0: Quality warnings
                 for qw in mon.get('quality_warnings', []):

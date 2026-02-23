@@ -627,7 +627,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v13.0 | 23.02.2026 | Portfolio Risk Manager + Direction check + GARCH Z")
+st.caption("v14.0 | 23.02.2026 | Portfolio Risk v2 + HR Drift Monitor + Direction check")
 
 # Sidebar
 with st.sidebar:
@@ -785,6 +785,46 @@ with tab1:
                                "🔴 растёт" if mon.get('garch_var_expanding') else "✅ стабильна")
                     gq3.metric("HL часов", f"{mon.get('halflife_hours', 0):.1f}")
                     gq4.metric("Z-window", f"{mon.get('z_window', 30)} бар")
+                
+                # v20: Dynamic HR Drift Monitoring (P4 Roadmap)
+                hr_entry = pos.get('entry_hr', 0)
+                hr_now = mon.get('hr_now', hr_entry)
+                if hr_entry > 0 and hr_now > 0:
+                    hr_drift_pct = abs(hr_now - hr_entry) / hr_entry * 100
+                    
+                    if hr_drift_pct > 5:  # Only show if drift is significant
+                        st.markdown("#### 📐 HR Drift Monitor")
+                        hd1, hd2, hd3 = st.columns(3)
+                        with hd1:
+                            dr_emoji = '✅' if hr_drift_pct < 10 else '🟡' if hr_drift_pct < 20 else '🔴'
+                            st.metric("HR дрейф", f"{dr_emoji} {hr_drift_pct:.1f}%",
+                                     f"Entry: {hr_entry:.4f} → Now: {hr_now:.4f}")
+                        with hd2:
+                            # Calculate impact: how much spread changed due to HR drift alone
+                            p2_now = mon.get('price2_now', pos.get('entry_price2', 1))
+                            hr_impact = abs(hr_now - hr_entry) * p2_now
+                            st.metric("Влияние на спред", f"{hr_impact:.4f}",
+                                     "USD сдвиг от дрейфа HR")
+                        with hd3:
+                            # Rebalance suggestion
+                            if hr_drift_pct > 15:
+                                st.metric("Ребаланс", "🔴 НУЖЕН",
+                                         f"HR изменился на {hr_drift_pct:.0f}%")
+                            elif hr_drift_pct > 10:
+                                st.metric("Ребаланс", "🟡 Рассмотрите",
+                                         f"HR дрейфует")
+                            else:
+                                st.metric("Ребаланс", "✅ Не нужен", "Дрейф в норме")
+                        
+                        if hr_drift_pct > 20:
+                            st.error(
+                                f"🚨 **HR ДРЕЙФ КРИТИЧЕСКИЙ: {hr_drift_pct:.1f}%**. "
+                                f"Entry HR={hr_entry:.4f}, текущий={hr_now:.4f}. "
+                                f"Коинтеграция могла разрушиться. Рассмотрите закрытие.")
+                        elif hr_drift_pct > 15:
+                            st.warning(
+                                f"⚠️ **HR дрейф {hr_drift_pct:.1f}%**: Entry={hr_entry:.4f}, "
+                                f"Now={hr_now:.4f}. Ребалансируйте позицию или закройте.")
                 
                 # v3.0: Quality warnings
                 for qw in mon.get('quality_warnings', []):

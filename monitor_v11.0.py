@@ -627,7 +627,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📍 Pairs Position Monitor")
-st.caption("v12.1 | 22.02.2026 | GARCH Z + Halflife sync + Direction sanity check")
+st.caption("v13.0 | 23.02.2026 | Portfolio Risk Manager + Direction check + GARCH Z")
 
 # Sidebar
 with st.sidebar:
@@ -700,8 +700,9 @@ open_positions = [p for p in positions if p['status'] == 'OPEN']
 closed_positions = [p for p in positions if p['status'] == 'CLOSED']
 
 # Tabs
-tab1, tab2 = st.tabs([f"📍 Открытые ({len(open_positions)})", 
-                       f"📋 История ({len(closed_positions)})"])
+tab1, tab2, tab3 = st.tabs([f"📍 Открытые ({len(open_positions)})", 
+                       f"📋 История ({len(closed_positions)})",
+                       f"📊 Портфель"])
 
 with tab1:
     if not open_positions:
@@ -950,6 +951,216 @@ with tab2:
         st.download_button("📥 Скачать историю сделок (CSV)", csv_history,
                           f"trades_history_{date_suffix}_{now_msk().strftime('%H%M')}.csv", "text/csv")
 
+# ═══════════════════════════════════════════════════════
+# TAB 3: PORTFOLIO RISK MANAGER (v19.0)
+# ═══════════════════════════════════════════════════════
+with tab3:
+    if not open_positions:
+        st.info("📭 Нет открытых позиций для анализа портфеля.")
+    else:
+        st.markdown("### 📊 Portfolio Risk Manager v2.0")
+        
+        # === 1. Collect all monitoring data upfront ===
+        mon_cache = {}
+        for pos in open_positions:
+            pair = f"{pos['coin1']}/{pos['coin2']}"
+            try:
+                mon = monitor_position(pos, exchange)
+                if mon:
+                    mon_cache[pos['id']] = mon
+            except Exception:
+                pass
+        
+        # === 2. Portfolio summary metrics ===
+        total_pnl_port = sum(m['pnl_pct'] for m in mon_cache.values())
+        n_pos = len(open_positions)
+        n_profit = sum(1 for m in mon_cache.values() if m['pnl_pct'] > 0)
+        n_loss = sum(1 for m in mon_cache.values() if m['pnl_pct'] < 0)
+        
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Позиций", n_pos)
+        pc2.metric("Совокупный P&L", f"{total_pnl_port:+.3f}%")
+        pc3.metric("Прибыльных", f"{n_profit}/{n_pos}",
+                  f"{n_profit/n_pos*100:.0f}%" if n_pos > 0 else "—")
+        avg_hours = sum(pos.get('hours_in', 0) for pos in open_positions) / n_pos if n_pos > 0 else 0
+        pc4.metric("Ср. время в позиции", f"{avg_hours:.1f}ч")
+        
+        # === 3. Coin exposure map ===
+        st.markdown("#### 🪙 Экспозиция по монетам")
+        coin_exposure = {}
+        for pos in open_positions:
+            c1, c2 = pos['coin1'], pos['coin2']
+            d = pos['direction']
+            for coin, coin_dir in [(c1, d), (c2, 'SHORT' if d == 'LONG' else 'LONG')]:
+                if coin not in coin_exposure:
+                    coin_exposure[coin] = {'long': 0, 'short': 0, 'pairs': [], 'pnl': 0.0}
+                if coin_dir == 'LONG':
+                    coin_exposure[coin]['long'] += 1
+                else:
+                    coin_exposure[coin]['short'] += 1
+                coin_exposure[coin]['pairs'].append(f"{c1}/{c2}")
+                mon = mon_cache.get(pos['id'])
+                if mon:
+                    coin_exposure[coin]['pnl'] += mon['pnl_pct'] / 2  # Split P&L between legs
+        
+        for coin, data in coin_exposure.items():
+            data['net'] = data['long'] - data['short']
+            data['total'] = data['long'] + data['short']
+        
+        sorted_coins = sorted(coin_exposure.items(), key=lambda x: x[1]['total'], reverse=True)
+        
+        # Concentration metric
+        max_coin = sorted_coins[0] if sorted_coins else ('—', {'total': 0})
+        max_exposure_pct = max_coin[1]['total'] / (n_pos * 2) * 100 if n_pos > 0 else 0
+        
+        # Exposure table
+        coin_rows = []
+        for coin, data in sorted_coins:
+            conflict = '🚨 КОНФЛИКТ' if data['long'] > 0 and data['short'] > 0 else ''
+            pct_of_port = data['total'] / (n_pos * 2) * 100 if n_pos > 0 else 0
+            bar = '█' * int(pct_of_port / 5) + '░' * (20 - int(pct_of_port / 5))
+            coin_rows.append({
+                'Монета': coin,
+                'LONG': data['long'],
+                'SHORT': data['short'],
+                'Всего': data['total'],
+                'Net': f"+{data['net']}" if data['net'] > 0 else str(data['net']),
+                '% порт.': f"{pct_of_port:.0f}%",
+                'P&L': f"{data['pnl']:+.3f}%",
+                'Конфликт': conflict,
+                'Пары': ', '.join(set(data['pairs'])),
+            })
+        if coin_rows:
+            st.dataframe(pd.DataFrame(coin_rows), use_container_width=True, hide_index=True)
+        
+        # === 4. RISK LIMITS CHECK ===
+        st.markdown("#### ⚠️ Лимиты риска")
+        
+        MAX_POSITIONS = 6
+        MAX_COIN_EXPOSURE = 3  # max positions per coin
+        MAX_CONCENTRATION_PCT = 40  # max % of portfolio in one coin
+        
+        lc1, lc2, lc3 = st.columns(3)
+        
+        with lc1:
+            pos_ok = n_pos <= MAX_POSITIONS
+            st.metric(
+                "Позиций", f"{n_pos}/{MAX_POSITIONS}",
+                "✅ OK" if pos_ok else "🔴 ПРЕВЫШЕН",
+                delta_color="normal" if pos_ok else "inverse"
+            )
+        
+        with lc2:
+            max_c = max_coin[1]['total'] if sorted_coins else 0
+            coin_ok = max_c <= MAX_COIN_EXPOSURE
+            st.metric(
+                f"Макс на монету ({max_coin[0]})", f"{max_c}/{MAX_COIN_EXPOSURE}",
+                "✅ OK" if coin_ok else "🔴 ПРЕВЫШЕН",
+                delta_color="normal" if coin_ok else "inverse"
+            )
+        
+        with lc3:
+            conc_ok = max_exposure_pct <= MAX_CONCENTRATION_PCT
+            st.metric(
+                "Концентрация", f"{max_exposure_pct:.0f}%/{MAX_CONCENTRATION_PCT}%",
+                "✅ OK" if conc_ok else "🔴 ПРЕВЫШЕНА",
+                delta_color="normal" if conc_ok else "inverse"
+            )
+        
+        # Warnings
+        warnings_found = False
+        for coin, data in sorted_coins:
+            if data['total'] >= MAX_COIN_EXPOSURE:
+                st.error(
+                    f"🚨 **{coin}** в {data['total']} позициях (лимит: {MAX_COIN_EXPOSURE}). "
+                    f"При обвале {coin} на 10% ВСЕ {data['total']} позиции пострадают! "
+                    f"**Закройте {data['total'] - MAX_COIN_EXPOSURE + 1} наименее прибыльную.**")
+                warnings_found = True
+            elif data['total'] >= 2:
+                st.warning(f"⚠️ **{coin}** в {data['total']} позициях ({data['long']}L/{data['short']}S)")
+                warnings_found = True
+            
+            if data['long'] > 0 and data['short'] > 0:
+                st.error(
+                    f"🚨 **{coin}** КОНФЛИКТ: LONG×{data['long']} + SHORT×{data['short']} "
+                    f"одновременно → хеджирование самого себя!")
+                warnings_found = True
+        
+        if not warnings_found:
+            st.success("✅ Портфель в пределах лимитов.")
+        
+        # === 5. Position P&L table ===
+        st.markdown("#### 📈 P&L по позициям")
+        pnl_data = []
+        for pos in open_positions:
+            pair = f"{pos['coin1']}/{pos['coin2']}"
+            mon = mon_cache.get(pos['id'])
+            if mon:
+                hours_in = pos.get('hours_in', 0)
+                pnl_data.append({
+                    '#': pos['id'],
+                    'Пара': pair,
+                    'Dir': pos['direction'],
+                    'Entry Z': f"{mon['z_entry']:+.2f}",
+                    'Now Z': f"{mon['z_now']:+.2f}",
+                    'P&L': f"{mon['pnl_pct']:+.3f}%",
+                    'Z→0': '✅' if mon['z_towards_zero'] else '❌',
+                    'Часов': f"{hours_in:.1f}",
+                    'Сигнал': (mon.get('exit_signal') or '—')[:35],
+                })
+        if pnl_data:
+            st.dataframe(pd.DataFrame(pnl_data), use_container_width=True, hide_index=True)
+        
+        # === 6. Quick recommendations ===
+        st.markdown("#### 💡 Рекомендации")
+        recs = []
+        
+        # Find worst position
+        worst_pos = None
+        worst_pnl = 0
+        for pos in open_positions:
+            mon = mon_cache.get(pos['id'])
+            if mon and mon['pnl_pct'] < worst_pnl:
+                worst_pnl = mon['pnl_pct']
+                worst_pos = pos
+        
+        if worst_pos and worst_pnl < -0.5:
+            recs.append(f"🔴 Худшая позиция: **{worst_pos['coin1']}/{worst_pos['coin2']}** "
+                       f"(P&L={worst_pnl:+.3f}%). Рассмотрите закрытие.")
+        
+        # Exit signals
+        exits = []
+        for pos in open_positions:
+            mon = mon_cache.get(pos['id'])
+            if mon and mon.get('exit_signal'):
+                exits.append(f"**{pos['coin1']}/{pos['coin2']}**: {mon['exit_signal'][:40]}")
+        if exits:
+            recs.append(f"📍 Сигналы выхода: " + "; ".join(exits))
+        
+        # Concentration
+        for coin, data in sorted_coins:
+            if data['total'] >= 3:
+                # Find least profitable pair with this coin
+                least_profit = None
+                least_pnl = 999
+                for pos in open_positions:
+                    if pos['coin1'] == coin or pos['coin2'] == coin:
+                        mon = mon_cache.get(pos['id'])
+                        if mon and mon['pnl_pct'] < least_pnl:
+                            least_pnl = mon['pnl_pct']
+                            least_profit = pos
+                if least_profit:
+                    recs.append(
+                        f"⚠️ Для снижения экспозиции на **{coin}** закройте "
+                        f"**{least_profit['coin1']}/{least_profit['coin2']}** "
+                        f"(наименее прибыльная: {least_pnl:+.3f}%)")
+        
+        if recs:
+            for r in recs:
+                st.markdown(r)
+        else:
+            st.success("✅ Нет критических рекомендаций. Портфель выглядит здоровым.")
+
 # Auto refresh
 if auto_refresh:
     time.sleep(120)
@@ -957,14 +1168,9 @@ if auto_refresh:
 
 st.divider()
 st.caption("""
-**Pairs Position Monitor v3.0** | Единые критерии входа с сканером v6.0
-
 Как добавить позицию:
-1. Найди 🟢 ВХОД в скринере (pairs_monitor.py v6.0)
-2. Проверь обязательные критерии (все должны быть ✅)
-3. Скопируй данные: Coin1, Coin2, Direction, Z, HR, цены
-4. Введи в форму слева → "Загрузить цены + Добавить"
-5. Монитор покажет когда закрывать + предупредит если пара потеряла качество
-
-Позиции сохраняются в positions.json — не потеряются при перезапуске.
+1. Найди 🟢 ВХОД в скринере
+2. Скопируй данные: Coin1, Coin2, Direction, Z, HR, цены
+3. Введи в форму слева → "Загрузить цены + Добавить"
+4. Монитор покажет когда закрывать + предупредит если пара потеряла качество
 """)

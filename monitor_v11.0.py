@@ -951,6 +951,20 @@ with tab1:
             st.download_button("📥 Скачать открытые позиции (CSV)", csv_open,
                 f"positions_open_{now_msk().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
                 key="open_pos_csv")
+            
+            # v20.1: Auto-save positions to disk every 10 minutes
+            try:
+                import os
+                os.makedirs("position_exports", exist_ok=True)
+                last_auto_save = st.session_state.get('_last_pos_save', 0)
+                now_ts = time.time()
+                if now_ts - last_auto_save > 600:  # 10 minutes
+                    save_path = f"position_exports/positions_open_{now_msk().strftime('%Y%m%d_%H%M')}.csv"
+                    pd.DataFrame(open_rows).to_csv(save_path, index=False)
+                    st.session_state['_last_pos_save'] = now_ts
+                    st.toast(f"💾 Позиции сохранены: {save_path}")
+            except Exception:
+                pass
 
 with tab2:
     if not closed_positions:
@@ -1200,6 +1214,54 @@ with tab3:
                 st.markdown(r)
         else:
             st.success("✅ Нет критических рекомендаций. Портфель выглядит здоровым.")
+        
+        # === 7. Portfolio Download ===
+        st.markdown("#### 📥 Экспорт портфеля")
+        portfolio_rows = []
+        for pos in open_positions:
+            mon = mon_cache.get(pos['id'])
+            portfolio_rows.append({
+                '#': pos['id'],
+                'Пара': f"{pos['coin1']}/{pos['coin2']}",
+                'Dir': pos['direction'],
+                'TF': pos.get('timeframe', '4h'),
+                'Entry_Z': pos.get('entry_z', 0),
+                'Current_Z': mon['z_now'] if mon else '',
+                'Entry_HR': pos.get('entry_hr', 0),
+                'Current_HR': mon['hr_now'] if mon else '',
+                'HR_Drift_%': round(abs(mon['hr_now'] - pos.get('entry_hr', 0)) / max(0.0001, pos.get('entry_hr', 0)) * 100, 1) if mon else '',
+                'P&L_%': round(mon['pnl_pct'], 4) if mon else '',
+                'Hours_In': round(mon['hours_in'], 1) if mon else '',
+                'HL_hours': round(mon.get('halflife_hours', 0), 1) if mon else '',
+                'Hurst': round(mon.get('hurst', 0.5), 3) if mon else '',
+                'P-value': round(mon.get('pvalue', 1.0), 4) if mon else '',
+                'Z_Toward_Zero': mon.get('z_towards_zero', '') if mon else '',
+                'Exit_Signal': (mon.get('exit_signal', '') or '')[:40] if mon else '',
+                'Entry_Time': pos.get('entry_time', ''),
+                'Entry_P1': pos.get('entry_price1', ''),
+                'Entry_P2': pos.get('entry_price2', ''),
+                'Now_P1': mon.get('price1_now', '') if mon else '',
+                'Now_P2': mon.get('price2_now', '') if mon else '',
+            })
+        if portfolio_rows:
+            portfolio_df = pd.DataFrame(portfolio_rows)
+            csv_portfolio = portfolio_df.to_csv(index=False)
+            
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button("📥 Портфель (CSV)", csv_portfolio,
+                    f"portfolio_{now_msk().strftime('%Y%m%d_%H%M')}.csv", "text/csv",
+                    key="portfolio_csv_btn")
+            with dl2:
+                # Also auto-save to disk
+                try:
+                    import os
+                    os.makedirs("position_exports", exist_ok=True)
+                    pf_path = f"position_exports/portfolio_{now_msk().strftime('%Y%m%d_%H%M')}.csv"
+                    portfolio_df.to_csv(pf_path, index=False)
+                    st.caption(f"💾 Сохранено: {pf_path}")
+                except Exception:
+                    pass
 
 # Auto refresh
 if auto_refresh:
